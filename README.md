@@ -21,8 +21,8 @@ based on Ubuntu 16.04 LTS. AMI will be created using a [Spot Instance](https://a
             ParameterKey=ImageName,ParameterValue=nvidia-docker \
             ParameterKey=InstanceType,ParameterValue=p2.xlarge \
             ParameterKey=KeyName,ParameterValue=my-key \
+        --on-failure DELETE \
         --stack-name nvidia-docker-ami
-        --on-failure DELETE
     ```
 
     If during the build something goes wrong, you can debug it:
