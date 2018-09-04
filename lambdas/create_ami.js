@@ -1,4 +1,4 @@
-var AWS = require('aws-sdk');
+var aws = require('aws-sdk');
 var response = require('cfn-response');
 
 exports.handler = function(event, context) {
@@ -7,7 +7,7 @@ exports.handler = function(event, context) {
     var physicalId = event.PhysicalResourceId;
 
     function success(data) {
-        data = data || {}
+        data = data || {};
         console.log('SUCCESS:\n', data);
         return response.send(event, context, response.SUCCESS, data, physicalId);
     }
@@ -22,46 +22,51 @@ exports.handler = function(event, context) {
         return success();
     }
 
-    var ec2 = new AWS.EC2();
+    var ec2 = new aws.EC2({region: event.ResourceProperties.Region});
 
     if (event.RequestType == 'Create' || event.RequestType == 'Update') {
-        var spotFleetRequestId = event.ResourceProperties.SpotFleetRequestId;
-        if (!spotFleetRequestId) {
-            return failed('SpotFleetRequestId required');
+        var instanceId = event.ResourceProperties.InstanceId;
+        if (!instanceId) {
+            return failed('InstanceId required');
         }
 
-        ec2.describeSpotFleetInstances({SpotFleetRequestId: spotFleetRequestId})
-        .promise()
-        .then((data) => {
-            console.log("Spot Instances Response:\n", JSON.stringify(data));
+        var imageName = event.ResourceProperties.ImageName;
+        if (!imageName) {
+            return failed('ImageName required');
+        }
 
-            var instanceId = data.ActiveInstances[0].InstanceId;
-
-            return ec2.createImage({
-                InstanceId: instanceId,
-                Name: event.RequestId
-            }).promise()
+        ec2.createImage({
+            InstanceId: instanceId,
+            Name: imageName
         })
+        .promise()
         .then((data) => {
             console.log('Creating image:\n', JSON.stringify(data));
 
             physicalId = data.ImageId;
 
-            return ec2.waitFor('imageAvailable', {
-                ImageIds: [data.ImageId]
-            }).promise()
-        })
-        .then((data) => {
-            console.log('Image available:\n', JSON.stringify(data));
-            console.log('Cancelling Spot Request...');
+            var tagsPromise = ec2.createTags({
+                Resources: [data.ImageId],
+                Tags: [
+                    {Key: 'spotty:stack-id', Value: event.StackId}
+                ]
+            }).promise();
 
-            return ec2.cancelSpotFleetRequests({
-                SpotFleetRequestIds: [spotFleetRequestId],
-                TerminateInstances: true
-            }).promise()
+            var imageAvailablePromise = ec2.waitFor('imageAvailable', {
+                ImageIds: [data.ImageId]
+            }).promise();
+
+            return Promise.all([tagsPromise, imageAvailablePromise]);
         })
         .then((data) => {
-            console.log('Spot Request cancelled:\n', data);
+            console.log('Image tagged:\n', JSON.stringify(data[0]));
+            console.log('Image available:\n', JSON.stringify(data[1]));
+            console.log('Terminating the instance...');
+
+            return ec2.terminateInstances({InstanceIds: [instanceId]}).promise();
+        })
+        .then((data) => {
+            console.log('"terminateInstances" Response:\n', JSON.stringify(data));
             success();
         })
         .catch((err) => failed(err));
@@ -83,14 +88,14 @@ exports.handler = function(event, context) {
         .promise()
         .then((data) => {
             if (!data.Images.length) {
-                throw new Error('No images found')
+                throw new Error('No images found');
             }
 
             console.log('"describeImages" response:\n', data);
 
             return ec2.deregisterImage({
                 ImageId: physicalId
-            }).promise()
+            }).promise();
         })
         .then((data) => {
             console.log('Image deregistered:\n', data);
@@ -100,22 +105,22 @@ exports.handler = function(event, context) {
                     Name: 'description',
                     Values: ['*' + physicalId + '*']
                 }]
-            }).promise()
+            }).promise();
         })
         .then((data) => {
             console.log('"describeSnapshots" response:\n', data);
 
             if (!data.Snapshots.length) {
-                throw new Error('No snapshots found')
+                throw new Error('No snapshots found');
             }
 
             return ec2.deleteSnapshot({
                 SnapshotId: data.Snapshots[0].SnapshotId
-            }).promise()
+            }).promise();
         })
         .then((data) => {
             console.log('Snapshot deleted:\n', data);
-            success()
+            success();
         })
         .catch((err) => failed(err));
     }
