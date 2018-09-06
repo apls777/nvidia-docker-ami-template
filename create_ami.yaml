@@ -9,11 +9,6 @@ Parameters:
   KeyName:
     Description: Key name to get an access o the instance
     Type: AWS::EC2::KeyPair::KeyName
-  IgnoreCreateAMIFunction:
-    Description: Run an instance without creating an AMI
-    Type: String
-    Default: 'false'
-    AllowedValues: ['true', 'false']
 Resources:
   FindBaseAMI:
     Type: Custom::AMI
@@ -111,7 +106,7 @@ Resources:
               --region ${AWS::Region} \
               -c cwlogs
 
-            # install Docker and goofys
+            # install NVIDIA Docker
             /usr/local/bin/cfn-init \
               --stack ${AWS::StackName} \
               --resource SpotInstanceLaunchTemplate \
@@ -119,22 +114,55 @@ Resources:
               -c init \
               -v
 
-            # send signal to create an AMI
+            INIT_EXIT_CODE=$?
+
+            # send signal that the instance is ready
             /usr/local/bin/cfn-signal \
-              -e $? \
+              -e $INIT_EXIT_CODE \
               --stack ${AWS::StackName} \
               --region ${AWS::Region} \
               --resource InstanceReadyWaitCondition
+
+            if [[ $INIT_EXIT_CODE -ne 0 ]] ; then
+              exit $INIT_EXIT_CODE
+            fi
+
+            # create the AMI
+            /usr/local/bin/cfn-init \
+              --stack ${AWS::StackName} \
+              --resource SpotInstanceLaunchTemplate \
+              --region ${AWS::Region} \
+              -c ami \
+              -v
+
+            AMI_EXIT_CODE=$?
+
+            # send signal that the AMI is created
+            /usr/local/bin/cfn-signal \
+              -e $AMI_EXIT_CODE \
+              --stack ${AWS::StackName} \
+              --region ${AWS::Region} \
+              --resource AMICreatedWaitCondition \
+              --data "`cat /tmp/ami_id`"
+
+            if [[ $AMI_EXIT_CODE -ne 0 ]] ; then
+              exit $AMI_EXIT_CODE
+            fi
+
+            # shutdown the instance
+            shutdown -h now
     Metadata:
       'AWS::CloudFormation::Init':
         configSets:
           init:
             - init_config
+          ami:
+            - ami_config
           cwlogs:
             - cwlogs_config
         init_config:
           files:
-            /root/init.sh:
+            /tmp/scripts/init.sh:
               content: !Sub |
                 # install Docker
                 apt-get update
@@ -171,7 +199,33 @@ Resources:
               group: root
           commands:
             run_init:
-              command: "/bin/bash -xe /root/init.sh"
+              command: '/bin/bash -xe /tmp/scripts/init.sh'
+        ami_config:
+          files:
+            /tmp/scripts/create_ami.sh:
+              content: !Sub |
+                touch /tmp/ami_id
+
+                # install AWS CLI
+                apt-get install -y awscli
+                aws configure set default.region ${AWS::Region}
+
+                # install jq
+                apt-get install -y jq
+
+                # create AMI
+                INSTANCE_ID=`curl http://169.254.169.254/latest/meta-data/instance-id`
+                IMAGE_ID=`aws ec2 create-image --instance-id $INSTANCE_ID --name ${ImageName} --no-reboot | jq -r '.ImageId'`
+                aws ec2 create-tags --resources $IMAGE_ID --tags Key=stack-id,Value=${AWS::StackId}
+                aws ec2 wait image-available --image-ids $IMAGE_ID
+
+                echo $IMAGE_ID > /tmp/ami_id
+              mode: '000755'
+              owner: root
+              group: root
+          commands:
+            create_ami:
+              command: '/bin/bash -xe /tmp/scripts/create_ami.sh'
         cwlogs_config:
           files:
             /tmp/cwlogs/logs.conf:
@@ -223,7 +277,7 @@ Resources:
           - sts:AssumeRole
       Path: '/'
       Policies:
-      - PolicyName: LogRolePolicy
+      - PolicyName: LogsPolicy
         PolicyDocument:
           Version: '2012-10-17'
           Statement:
@@ -235,6 +289,16 @@ Resources:
             Resource:
             - arn:aws:logs:*:*:*
             - arn:aws:s3:::*
+      - PolicyName: AMICreationPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - 'ec2:DescribeImages'
+            - 'ec2:CreateImage'
+            - 'ec2:CreateTags'
+            Resource: ['*']
   InstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
@@ -249,35 +313,34 @@ Resources:
       ResourceSignal:
         Timeout: PT20M
 
-  CreateAMI:
-    Type: Custom::AMI
+  AMICreatedWaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
     DependsOn: InstanceReadyWaitCondition
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT20M
+
+  DeleteAMI:
+    Type: Custom::AMI
+    DependsOn: AMICreatedWaitCondition
     Properties:
-      ServiceToken: !GetAtt CreateAMIFunction.Arn
-      InstanceId: !Ref SpotInstance
-      ImageName: !Ref ImageName
-      IgnoreFunction: !Ref IgnoreCreateAMIFunction
-  CreateAMIFunction:
+      ServiceToken: !GetAtt DeleteAMIFunction.Arn
+  DeleteAMIFunction:
     Type: AWS::Lambda::Function
     Properties:
       Handler: index.handler
-      Role: !GetAtt CreateAMILambdaExecutionRole.Arn
+      Role: !GetAtt DeleteAMILambdaExecutionRole.Arn
       Code:
         ZipFile: !Sub |
-          var aws=require('aws-sdk');var response=require('cfn-response');exports.handler=function(event,context){console.log("Request received:\n",JSON.stringify(event));var physicalId=event.PhysicalResourceId;function success(data){data=data||{};console.log('SUCCESS:\n',data);return response.send(event,context,response.SUCCESS,data,physicalId)}
+          var aws=require('aws-sdk');var response=require('cfn-response');exports.handler=function(event,context){console.log('Request received:\n',JSON.stringify(event));var physicalId=event.PhysicalResourceId;function success(data){data=data||{};console.log('SUCCESS:\n',data);return response.send(event,context,response.SUCCESS,data,physicalId)}
           function failed(err){console.log('FAILED:\n',err);return response.send(event,context,response.FAILED,err,physicalId)}
-          if(event.ResourceProperties.IgnoreFunction=='true'){console.log('AMI not created (the function is ignored)');return success()}
-          var ec2=new aws.EC2({region:event.ResourceProperties.Region});if(event.RequestType=='Create'||event.RequestType=='Update'){var instanceId=event.ResourceProperties.InstanceId;if(!instanceId){return failed('InstanceId required')}
-          var imageName=event.ResourceProperties.ImageName;if(!imageName){return failed('ImageName required')}
-          ec2.createImage({InstanceId:instanceId,Name:imageName}).promise().then((data)=>{console.log('Creating image:\n',JSON.stringify(data));physicalId=data.ImageId;var tagsPromise=ec2.createTags({Resources:[data.ImageId],Tags:[{Key:'spotty:stack-id',Value:event.StackId}]}).promise();var imageAvailablePromise=ec2.waitFor('imageAvailable',{ImageIds:[data.ImageId]}).promise();return Promise.all([tagsPromise,imageAvailablePromise])}).then((data)=>{console.log('Image tagged:\n',JSON.stringify(data[0]));console.log('Image available:\n',JSON.stringify(data[1]));console.log('Terminating the instance...');return ec2.terminateInstances({InstanceIds:[instanceId]}).promise()}).then((data)=>{console.log('"terminateInstances" Response:\n',JSON.stringify(data));success()}).catch((err)=>failed(err))}else if(event.RequestType=='Delete'){if(!physicalId){console.log('AMI ID not specified')
-          return success()}else if(physicalId.indexOf('ami-')!==0){console.log('Physical ID is not an AMI ID')
-          return success()}
-          console.log('Searching AMI with ID='+physicalId);ec2.describeImages({ImageIds:[physicalId]}).promise().then((data)=>{if(!data.Images.length){throw new Error('No images found')}
-          console.log('"describeImages" response:\n',data);return ec2.deregisterImage({ImageId:physicalId}).promise()}).then((data)=>{console.log('Image deregistered:\n',data);return ec2.describeSnapshots({Filters:[{Name:'description',Values:['*'+physicalId+'*']}]}).promise()}).then((data)=>{console.log('"describeSnapshots" response:\n',data);if(!data.Snapshots.length){throw new Error('No snapshots found')}
+          if(event.RequestType=='Create'||event.RequestType=='Update'){ec2.describeImages({Filters:[{Name:'tag:stack-id',Values:[event.StackId]}]}).promise().then((data)=>{if(!data.Images.length){throw new Error('No images found')}
+          console.log('"describeImages" response:\n',data);physicalId=data.Images[0].ImageId;success()}).catch((err)=>failed(err))}else{var ec2=new aws.EC2({region:event.ResourceProperties.Region}),imageId=physicalId;console.log('Searching AMI with ID='+imageId);ec2.describeImages({ImageIds:[imageId]}).promise().then((data)=>{if(!data.Images.length){throw new Error('No images found')}
+          console.log('"describeImages" response:\n',data);return ec2.deregisterImage({ImageId:imageId}).promise()}).then((data)=>{console.log('Image deregistered:\n',data);return ec2.describeSnapshots({Filters:[{Name:'description',Values:['*'+imageId+'*']}]}).promise()}).then((data)=>{console.log('"describeSnapshots" response:\n',data);if(!data.Snapshots.length){throw new Error('No snapshots found')}
           return ec2.deleteSnapshot({SnapshotId:data.Snapshots[0].SnapshotId}).promise()}).then((data)=>{console.log('Snapshot deleted:\n',data);success()}).catch((err)=>failed(err))}}
       Runtime: nodejs4.3
-      Timeout: 300
-  CreateAMILambdaExecutionRole:
+      Timeout: 60
+  DeleteAMILambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -300,14 +363,10 @@ Resources:
           Statement:
             - Effect: Allow
               Action:
-              - 'ec2:DescribeInstances'
               - 'ec2:DescribeImages'
-              - 'ec2:CreateImage'
-              - 'ec2:DeregisterImage'
               - 'ec2:DescribeSnapshots'
+              - 'ec2:DeregisterImage'
               - 'ec2:DeleteSnapshot'
-              - 'ec2:TerminateInstances'
-              - 'ec2:CreateTags'
               Resource: ['*']
 Outputs:
   BaseAMI:
@@ -315,7 +374,7 @@ Outputs:
     Value: !Ref FindBaseAMI
   NewAMI:
     Description: Created AMI ID
-    Value: !Ref CreateAMI
+    Value: !Ref DeleteAMI
   InstanceLogGroupName:
     Description: CloudWatch log group name for the instance
     Value: !Ref InstanceLogGroup
