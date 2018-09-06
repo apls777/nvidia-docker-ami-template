@@ -17,6 +17,8 @@ exports.handler = function(event, context) {
         return response.send(event, context, response.FAILED, err, physicalId);
     }
 
+    var ec2 = new aws.EC2({region: event.ResourceProperties.Region});
+
     if (event.RequestType == 'Create' || event.RequestType == 'Update') {
         ec2.describeImages({Filters: [{Name: 'tag:stack-id',  Values: [event.StackId]}]})
         .promise()
@@ -33,8 +35,7 @@ exports.handler = function(event, context) {
         })
         .catch((err) => failed(err));
     } else {
-        var ec2 = new aws.EC2({region: event.ResourceProperties.Region}),
-            imageId = physicalId;
+        var imageId = physicalId;
 
         console.log('Searching AMI with ID=' + imageId);
 
